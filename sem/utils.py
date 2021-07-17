@@ -3,15 +3,24 @@ import math
 import copy
 import warnings
 import re
+import os
+import time
+from copy import deepcopy
+from pprint import pformat
+from operator import and_, or_
 from pathlib import Path
 from itertools import product
-from functools import wraps
+from functools import reduce, wraps
 
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.core.numeric as nx
 import SALib.analyze.sobol
 import SALib.sample.saltelli
+
+from tinydb import TinyDB, where, Query
+from tinydb.storages import JSONStorage
+from tinydb.middlewares import CachingMiddleware
 
 try:
     DRMAA_AVAILABLE = True
@@ -481,3 +490,327 @@ def convert_environment_str_to_dict(log_components):
             raise ValueError("Provided log_components string '%s' is invalid\n" % log_components)
 
     return log_components_dict
+
+
+def process_logs(log_file):
+    """
+    Create a TinyDB instance, parse the log file and insert the logs to a
+    TinyDB instance.
+
+    Returns a TinyDB instance containing the logs from the log file and the
+    path to where that instance is stored.
+
+    Args:
+        log_file (str): Path to where the log file is stored
+    """
+    if not Path(log_file).exists():
+        raise FileNotFoundError("Cannot access file '%s'\n" % log_file)
+
+    logs = parse_logs(log_file)
+
+    data_dir = os.path.join('/tmp/', str(time.strftime("%Y-%m-%d::%H-%M-%S")) + ':logs.json')
+    if Path(data_dir).exists():
+        raise FileExistsError("File path '%s' already exists" % data_dir)
+
+    db = TinyDB(data_dir,
+                storage=CachingMiddleware(JSONStorage))
+
+    insert_logs(logs, db)
+    # TODO Find a more elegant way to clean up TinyDB directory after
+    # completion
+    return db, data_dir
+
+
+def parse_logs(log_file):
+    """
+    Parse the logs from a log file.
+
+    Return a list of dictionaries with each dictionary having the following
+    format:
+    dictionary = {
+        'time': timestamp,  # float
+        'context': context/nodeId,  # str
+        'Extended_Context': ,   #str
+        'component': log component,  # str
+        'function': function name,  # str
+        'arguments': function arguments,  # str
+        'severity_class': log severity class,  # str
+        'message': log message  # str
+    }
+    Note: This function will skip the log lines that do not have the same
+          structure as ns-3 logs with prefix level set to prefix_all.
+
+    Args:
+        log_file (string): Path to where the log file is stored
+    """
+    log_list = []
+
+    # Regex for parsing the logs
+    # time: Accepts string of form "[+-]'digits.digits's". The number of digits
+    #       is variable as user can change time resolution.
+    time_re = r'[\+\-]?(?P<time>\d+\.\d+)s '
+    # context: Accepts string of form "digits" or "-digits".
+    # extended_context: Accepts everything between [] followed by a space. i.e.
+    #                   '[Extended Context] '.
+    # Note: '.*?' will try to match minimum possible string. Or in other words,
+    #       it is a non greedy match.
+    context_extended_context_re = r'(?P<context>(?:\d+|-\d+)) (?:\[(?P<extended_context>.*?)\] )?'
+    # component: Accepts string of form '[a-zA-Z0-9_]'
+    # function: Accepts string of form '[a-zA-Z0-9_]'
+    # arguments: Accepts everything between '()'(after function name).
+    # Note: '.*?' will try to match minimum possible string. Or in other words,
+    #       it is a non greedy match.
+    component_function_arguments_re = r'(?P<component>\w+):(?P<function>\w+)\((?P<arguments>.*?)\)'
+    # severity_class: Accepts string of form '[a-zA-Z0-9_]'
+    # message: Accepts everything after 'severity_class '.
+    # Note: '\s*' matches extra spaces if present after severity_class.
+    # Note: 'severity_class_message_re' is optional as when
+    #       severity_class=function severity_class and message are not present
+    #       in the resultant log. 
+    severity_class_message_re = r'(?:: \[(?P<severity_class>\w+)\s*\] (?P<message>.*))?'
+
+    regex = re.compile(r'^' + time_re + context_extended_context_re + component_function_arguments_re + severity_class_message_re + r'$')
+
+    with open(log_file) as f:
+        for log in f:
+            # Groups structure
+            # group[1] = Time
+            # group[2] = Context
+            # group[3] = Extended Context; For example, '-1 [node -1]' group[2] = -1 and group[3] = node -1
+            # group[4] = Component
+            # group[5] = Function
+            # group[6] = Arguments
+            # group[7] = Severity_class
+            # group[8] = Message
+
+            # Example: '+0.000000000s -1 PowerAdaptationDistance:SetupPhy(): [DEBUG] OfdmRate6Mbps 0.00192 6000000bps'
+            # group[1] = 0.000000000
+            # group[2] = -1
+            # group[3] = None
+            # group[4] = PowerAdaptationDistance
+            # group[5] = SetupPhy
+            # group[6] = ''
+            # group[7] = DEBUG
+            # group[8] = OfdmRate6Mbps 0.00192 6000000bps
+            groups = regex.match(log)
+
+            if groups is None:
+                warnings.warn("Log format is not consistent with prefix_all. Skipping log '%s'" % log, RuntimeWarning)
+                continue
+
+            temp_dict = None
+            # Remove trailing whitespaces after message
+            message = groups.group('message')
+            if message is not None:
+                message = message.rstrip()
+
+            # If level is function
+            if groups.group('severity_class') is None and groups.group('message') is None:
+                temp_dict = {
+                    'time': float(groups.group('time')),
+                    'context': groups.group('context'),
+                    'extended_context': groups.group('extended_context'),
+                    'component': groups.group('component'),
+                    'function': groups.group('function'),
+                    'arguments': groups.group('arguments'),
+                    'severity_class': 'FUNCTION',
+                    'message': ''
+                }
+            else:
+                temp_dict = {
+                    'time': float(groups.group('time')),
+                    'context': groups.group('context'),
+                    'extended_context': groups.group('extended_context'),
+                    'component': groups.group('component'),
+                    'function': groups.group('function'),
+                    'arguments': groups.group('arguments'),
+                    'severity_class': groups.group('severity_class'),
+                    'message': message
+                }
+            log_list.append(temp_dict)
+
+    return log_list
+
+
+def insert_logs(logs, db):
+    """
+    Insert the logs in the TinyDB instance passed.
+
+    Note: This function does not return anything.
+
+    Args:
+        logs (list): A list of logs to insert in database. Logs are described
+                     as a python dict
+        db (TinyDB instance): A TinyDB instace where the logs will be inserted.
+    """
+    if logs == [] or logs is None:
+        return
+
+    example_result = {
+        k: ['...'] for k in ['time',
+                             'context',
+                             'component',
+                             'extended_context',
+                             'function',
+                             'arguments',
+                             'severity_class',
+                             'message']
+    }
+
+    for log in logs:
+        # Verify log format is correct
+        # Only check if the keys are consistent
+        if not(set(log.keys()) == set(example_result.keys())):
+            raise ValueError(
+                '%s:\nExpected: %s\nGot: %s' % (
+                    "Log dictionary does not correspond to database format",
+                    pformat(example_result, depth=2),
+                    pformat(log, depth=2)))
+
+    db.table('logs').insert_multiple(deepcopy(logs))
+
+
+def wipe_results(db, data_dir):
+    """
+    Remove all logs from the database.
+
+    This also removes all output files, and cannot be undone.
+
+    Note: This function does not return anything.
+
+    Args:
+        db (TinyDB instance): A TinyDB instace where the logs are inserted.
+        data_dir (str): Path to where the TinyDB instance is stored
+    """
+    # Clean logs table
+    db.drop_table('logs')
+    db.storage.flush()
+
+    # Get rid of contents of data dir
+    try:
+        os.remove(data_dir)
+    except OSError as error:
+        print(error)
+        print("File path '%s' can not be removed" % data_dir)
+
+
+def filter_logs(db,
+                severity_class=None,
+                components=None,
+                function=None,
+                context=None,
+                time_begin=None,
+                time_end=None):
+    """
+    Filter the logs stored in the database.
+
+    Filters are applied on context, function name, log sevirity class and time.
+    Additionally the user can also filter each log component based on a
+    particular sevirity class using components dictionary.
+    For example, if the user specifies Context = [0, 1] and Function = [A, B]
+    the function will output logs in which (context == 0 or context == 1) and
+    (function == a or function == b).
+
+    Return a list of logs that satisfy all the passed filters. Each log is
+    represented by a dictionary.
+
+    Args:
+        db (TinyDB instance): A TinyDB instace where the logs are inserted.
+        context (list, str, int): A list of context based on which the logs
+            will be filtered. If only one context is to be provided, then this
+            paramter can also be a string or an int.
+        function (list, str): A list of function names based on which the logs
+            will be filtered. If only one function name is to be provided, then
+            this paramter can also be a string.
+        time_begin (float): Start timestamp (in seconds) of the time window.
+        time_end (float): End timestamp (in seconds) of the time window.
+        severity_class (list, str): A list of log severity classes based on
+            which the logs will be filtered. If only one log severity class is
+            to be provided, then this paramter can also be a string.
+        components (dict): A dictionary having structure
+            {
+                components:['class1','class2']
+            }
+            based on which the logs will be filtered.
+    """
+    query_final = []
+
+    # Assert that the passed paramters are of valid type.
+    if severity_class is not None:
+        if severity_class is not None:
+            if isinstance(severity_class, str):
+                severity_class = [severity_class]
+            elif isinstance(severity_class, list):
+                pass
+            else:
+                raise TypeError("severity_class can only be a list or a string (if only one value is passed).")
+
+    if components is not None:
+        for key, value in components.items():
+            if isinstance(value, str):
+                components[key] = [value]
+            elif isinstance(value, list):
+                pass
+            else:
+                raise TypeError("values in components dictionary can only be a list or a string (if only one value is passed).")
+
+    if function is not None:
+        if isinstance(function, str):
+            function = [function]
+        elif isinstance(function, list):
+            pass
+        else:
+            raise TypeError("function can only be a list or a string (if only one value is passed).")
+
+    if context is not None:
+        if isinstance(context, str) or isinstance(context, int):
+            context = [str(context)]
+        elif isinstance(context, list):
+            pass
+        else:
+            raise TypeError("context can only be a list or a string (if only one value is passed).")
+
+    # Build TinyDB query based on the passed paramters
+    if severity_class is not None or components is not None:
+        query_list = []
+        if severity_class is not None:
+            query = reduce(or_, [
+                           where('severity_class') == lvl.upper()
+                           for lvl in severity_class
+                           ])
+            query_list.append(query)
+        # If components is provided apply the specified log severity classes
+        # to the specified log components in addition to the log severity
+        # classes passed with 'severity_class'. In other words, log severity
+        # classes passed with 'severity_class' is treated as a global filter.
+        if components is not None:
+            query = reduce(or_, [reduce(or_, [
+                    Query().fragment({'component': component,
+                                      'severity_class': cls.upper()})
+                    for cls in classes])
+                    for component, classes in components.items()])
+            query_list.append(query)
+
+        query_final.append(reduce(or_, query_list))
+
+    if function is not None:
+        query = reduce(or_, [where('function') == fnc for fnc in function])
+        query_final.append(query)
+
+    if context is not None:
+        query = reduce(or_, [where('context') == str(ctx) for ctx in context])
+        query_final.append(query)
+
+    if time_begin is not None:
+        query = where('time') >= float(time_begin)
+        query_final.append(query)
+
+    if time_end is not None:
+        query = where('time') <= float(time_end)
+        query_final.append(query)
+
+    if query_final is not None:
+        query = reduce(and_, query_final)
+        return [dict(i) for i in db.table('logs').search(query)]
+    else:
+        return []
